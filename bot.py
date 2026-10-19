@@ -17,7 +17,7 @@ logging.basicConfig(
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-URL_PRODUTOS = "https://5sim.net/v1/guest/products"
+URL_PRODUTOS = "https://5sim.net/v1/guest/products/"
 URL_CAMBIO = "https://api.frankfurter.dev/v1/latest"
 
 LUCRO_WHATSAPP = 10.00
@@ -44,11 +44,13 @@ def obter_cambio():
         return None
 
 
-def buscar_produtos():
+def buscar_produtos(pais="brazil", operadora="any"):
+    """Busca os produtos de um país e operadora na API pública da 5SIM."""
+    url = f"https://5sim.net/v1/guest/products/{pais}/{operadora}"
     try:
-        r = requests.get(URL_PRODUTOS, timeout=20)
-        r.raise_for_status()
-        dados = r.json()
+        resposta = requests.get(url, timeout=20)
+        resposta.raise_for_status()
+        dados = resposta.json()
         return dados if isinstance(dados, dict) else {}
     except (requests.RequestException, ValueError) as erro:
         logging.warning("Erro ao buscar produtos: %s", erro)
@@ -56,14 +58,17 @@ def buscar_produtos():
 
 
 def encontrar_servicos(produtos):
+    """Converte a resposta da 5SIM em uma lista uniforme de ofertas."""
     encontrados = []
-    for operadora, servicos in produtos.items():
-        if not isinstance(servicos, dict):
-            continue
-        for servico, detalhes in servicos.items():
-            nome = str(servico).lower()
-            if nome in SERVICOS and isinstance(detalhes, dict):
-                encontrados.append((operadora, nome, detalhes))
+
+    if not isinstance(produtos, dict):
+        return encontrados
+
+    for servico, detalhes in produtos.items():
+        nome = str(servico).lower()
+        if nome in SERVICOS and isinstance(detalhes, dict):
+            encontrados.append(("brazil", nome, detalhes))
+
     return encontrados
 
 
