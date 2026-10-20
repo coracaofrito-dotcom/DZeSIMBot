@@ -17,6 +17,9 @@ logging.basicConfig(
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
+VALOR_MINIMO_PIX = 5.00
+MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN")
+
 URL_PRODUTOS = "https://5sim.net/v1/guest/products/"
 URL_CAMBIO = "https://api.frankfurter.dev/v1/latest"
 
@@ -313,3 +316,56 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def criar_cobranca_pix(valor, descricao, referencia):
+    """Cria uma cobrança PIX e retorna os dados necessários para o pagamento."""
+    import mercadopago
+
+    try:
+        valor = round(float(valor), 2)
+    except (TypeError, ValueError):
+        return {"erro": "Valor inválido."}
+
+    if valor < VALOR_MINIMO_PIX:
+        return {"erro": "O valor mínimo para pagamento PIX é R$ 5,00."}
+
+    if not MP_ACCESS_TOKEN:
+        return {"erro": "Mercado Pago não configurado."}
+
+    try:
+        sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
+        pagamento = sdk.payment().create({
+            "transaction_amount": valor,
+            "description": str(descricao)[:200],
+            "payment_method_id": "pix",
+            "external_reference": str(referencia)[:100],
+            "payer": {
+                "email": os.getenv("MP_PAYER_EMAIL", "test_user_123456@testuser.com"),
+            },
+        })
+
+        resposta = pagamento.get("response", {})
+        if pagamento.get("status") not in (200, 201):
+            return {"erro": "Não foi possível criar a cobrança PIX."}
+
+        dados_pix = resposta.get("point_of_interaction", {}).get(
+            "transaction_data", {}
+        )
+        codigo = dados_pix.get("qr_code")
+        imagem_base64 = dados_pix.get("qr_code_base64")
+
+        if not resposta.get("id") or not codigo:
+            return {"erro": "O Mercado Pago não retornou os dados PIX esperados."}
+
+        return {
+            "id": resposta["id"],
+            "status": resposta.get("status", "pending"),
+            "valor": valor,
+            "codigo_pix": codigo,
+            "qr_code_base64": imagem_base64,
+            "referencia": str(referencia),
+        }
+    except Exception:
+        logging.exception("Falha ao criar cobrança PIX.")
+        return {"erro": "Erro ao comunicar com o Mercado Pago."}

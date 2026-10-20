@@ -2,3 +2,4 @@ python-telegram-bot>=21,<23
 requests>=2.31,<3
 
 mercadopago>=3.6,<4
+qrcode[pil]>=8.2,<9
