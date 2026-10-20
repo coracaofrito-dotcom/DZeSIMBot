@@ -185,7 +185,7 @@ async def mostrar_catalogo(query, pais, pagina=0):
         margem = margens.get(nome.lower(), 2.00)
 
         if cambio is None:
-            preco_texto = f"US$ {usd:.2f} + margem R$ {margem:.2f}"
+            preco_texto = "Preço temporariamente indisponível"
         else:
             preco_texto = f"R$ {usd * cambio + margem:.2f}"
 
@@ -271,7 +271,7 @@ async def botoes(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     preco = (
                         f"R$ {usd * cambio + margem:.2f}"
                         if cambio is not None
-                        else f"US$ {usd:.2f} + margem R$ {margem:.2f}"
+                        else "Preço temporariamente indisponível"
                     )
                     texto = (
                         f"📋 {nome}\n🌎 País: {pais}\n"
