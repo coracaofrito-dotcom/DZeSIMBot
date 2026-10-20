@@ -1,0 +1,407 @@
+import os
+import logging
+import requests
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+)
+
+from paises import buscar_paises
+
+logging.basicConfig(
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
+URL_PRODUTOS = "https://5sim.net/v1/guest/products/"
+URL_CAMBIO = "https://api.frankfurter.dev/v1/latest"
+
+LUCRO_WHATSAPP = 10.00
+LUCRO_TELEGRAM = 3.00
+LUCRO_SMS = 2.00
+
+SERVICOS = {
+    "whatsapp": "WhatsApp",
+    "telegram": "Telegram",
+    "sms": "SMS",
+}
+
+
+def obter_cambio():
+    try:
+        r = requests.get(
+            URL_CAMBIO,
+            params={"from": "USD", "to": "BRL"},
+            timeout=15,
+        )
+        r.raise_for_status()
+        return float(r.json()["rates"]["BRL"])
+    except (requests.RequestException, KeyError, ValueError, TypeError):
+        return None
+
+
+def buscar_produtos(pais="brazil", operadora="any"):
+    """Busca os produtos de um país e operadora na API pública da 5SIM."""
+    url = f"https://5sim.net/v1/guest/products/{pais}/{operadora}"
+    try:
+        resposta = requests.get(url, timeout=20)
+        resposta.raise_for_status()
+        dados = resposta.json()
+        return dados if isinstance(dados, dict) else {}
+    except (requests.RequestException, ValueError) as erro:
+        logging.warning("Erro ao buscar produtos: %s", erro)
+        return {}
+
+
+def encontrar_servicos(produtos, pais="brazil"):
+    """Retorna todos os serviços do catálogo, não apenas três nomes."""
+    encontrados = []
+    if not isinstance(produtos, dict):
+        return encontrados
+
+    for servico, detalhes in produtos.items():
+        if not isinstance(detalhes, dict):
+            continue
+        try:
+            preco = float(detalhes.get("Price", 0) or 0)
+            quantidade = int(detalhes.get("Qty", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+
+        if preco >= 0 and quantidade > 0:
+            encontrados.append((pais, str(servico), detalhes))
+
+    return sorted(encontrados, key=lambda item: item[1].lower())
+
+
+def montar_menu():
+    teclado = [
+        [InlineKeyboardButton("📱 Catálogo do Brasil (preços)", callback_data="servicos:brazil:0")],
+        [InlineKeyboardButton("🌎 Países disponíveis", callback_data="paises:0")],
+    ]
+    return InlineKeyboardMarkup(teclado)
+
+
+def listar_paises():
+    """Obtém os países que a API pública da 5SIM disponibiliza."""
+    try:
+        r = requests.get("https://5sim.net/v1/guest/countries", timeout=20)
+        r.raise_for_status()
+        dados = r.json()
+        return sorted(dados.keys()) if isinstance(dados, dict) else []
+    except (requests.RequestException, ValueError):
+        logging.warning("Não foi possível consultar os países da 5SIM.")
+        return []
+
+
+async def mostrar_paises(query, pagina=0):
+    paises = listar_paises()
+    if not paises:
+        await query.edit_message_text(
+            "Não consegui consultar os países agora. Tente novamente mais tarde."
+        )
+        return
+
+    por_pagina = 8
+    inicio = pagina * por_pagina
+    lote = paises[inicio:inicio + por_pagina]
+    teclado = []
+
+    for codigo in lote:
+        nome = codigo.replace("and", " and ").replace("-", " ").title()
+        teclado.append([
+            InlineKeyboardButton(nome, callback_data=f"servicos:{codigo}:0")
+        ])
+
+    navegacao = []
+    if pagina > 0:
+        navegacao.append(
+            InlineKeyboardButton("⬅️ Anterior", callback_data=f"paises:{pagina - 1}")
+        )
+    if inicio + por_pagina < len(paises):
+        navegacao.append(
+            InlineKeyboardButton("Próximos ➡️", callback_data=f"paises:{pagina + 1}")
+        )
+    if navegacao:
+        teclado.append(navegacao)
+    teclado.append([InlineKeyboardButton("🏠 Menu", callback_data="inicio")])
+
+    await query.edit_message_text(
+        f"🌎 Escolha um país ({len(paises)} disponíveis)\n"
+        f"Página {pagina + 1} de {(len(paises) + por_pagina - 1) // por_pagina}:",
+        reply_markup=InlineKeyboardMarkup(teclado),
+    )
+
+
+async def mostrar_catalogo(query, pais, pagina=0):
+    await query.edit_message_text("⏳ Consultando serviços, preços e estoque...")
+    produtos = buscar_produtos(pais, "any")
+    cambio = obter_cambio()
+
+    itens = encontrar_servicos(produtos, pais)
+    if not itens:
+        await query.edit_message_text(
+            f"Não encontrei serviços com estoque para {pais}.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ Países", callback_data="paises:0")
+            ]]),
+        )
+        return
+
+    por_pagina = 8
+    total_paginas = (len(itens) + por_pagina - 1) // por_pagina
+    pagina = max(0, min(pagina, total_paginas - 1))
+    lote = itens[pagina * por_pagina:(pagina + 1) * por_pagina]
+
+    linhas = [
+        f"📋 Catálogo de serviços — {pais.title()}",
+        f"📦 {len(itens)} serviços com estoque",
+        "Preços estimados; nenhum pedido será comprado automaticamente.",
+        "",
+    ]
+    teclado = []
+
+    for _, nome, dados in lote:
+        try:
+            usd = float(dados.get("Price", 0))
+            qtd = int(dados.get("Qty", 0))
+        except (TypeError, ValueError):
+            continue
+
+        # Mantém as margens já configuradas para WhatsApp e Telegram;
+        # para os outros serviços aplica a margem padrão de R$ 2.
+        margens = {
+            "whatsapp": LUCRO_WHATSAPP,
+            "telegram": LUCRO_TELEGRAM,
+            "sms": LUCRO_SMS,
+        }
+        margem = margens.get(nome.lower(), 2.00)
+
+        if cambio is None:
+            preco_texto = f"US$ {usd:.2f} + margem R$ {margem:.2f}"
+        else:
+            preco_texto = f"R$ {usd * cambio + margem:.2f}"
+
+        linhas.append(f"• {nome} — {preco_texto} | estoque: {qtd}")
+        teclado.append([
+            InlineKeyboardButton(
+                f"ℹ️ {nome[:45]}",
+                callback_data=f"detalhe:{pais}:{nome}",
+            )
+        ])
+
+    navegacao = []
+    if pagina > 0:
+        navegacao.append(InlineKeyboardButton(
+            "⬅️ Anterior", callback_data=f"servicos:{pais}:{pagina - 1}"
+        ))
+    if pagina + 1 < total_paginas:
+        navegacao.append(InlineKeyboardButton(
+            "Próxima ➡️", callback_data=f"servicos:{pais}:{pagina + 1}"
+        ))
+    if navegacao:
+        teclado.append(navegacao)
+    teclado.append([InlineKeyboardButton("🌎 Trocar país", callback_data="paises:0")])
+
+    linhas.append("")
+    linhas.append(f"Página {pagina + 1} de {total_paginas}")
+    await query.edit_message_text(
+        "\n".join(linhas)[:4000],
+        reply_markup=InlineKeyboardMarkup(teclado),
+    )
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    mensagem = (
+        "👋 Bem-vindo ao DZ E-SIM!\n\n"
+        "Escolha um serviço para consultar o catálogo de preços.\n"
+        "Este catálogo é informativo; nenhuma compra será realizada aqui."
+    )
+    if update.message:
+        await update.message.reply_text(mensagem, reply_markup=montar_menu())
+
+
+async def mostrar_paises(query, pagina=0):
+    paises = buscar_paises()
+    if not paises:
+        await query.edit_message_text(
+            "Não consegui consultar os países agora. Tente novamente mais tarde."
+        )
+        return
+
+    nomes = []
+    for codigo, dados in paises.items():
+        if isinstance(dados, dict):
+            nome = dados.get("text") or dados.get("name") or codigo
+        else:
+            nome = codigo
+        nomes.append(str(nome))
+
+    texto = "🌎 Países encontrados: " + str(len(nomes)) + "\n\n"
+    texto += "\n".join("• " + nome for nome in nomes[:40])
+    if len(nomes) > 40:
+        texto += f"\n\n... e mais {len(nomes) - 40} países."
+    texto += "\n\nUse /start para voltar ao menu."
+    await query.edit_message_text(texto)
+
+
+async def mostrar_catalogo(query, nome_servico):
+    await query.edit_message_text("⏳ Consultando preços e disponibilidade...")
+    produtos = buscar_produtos()
+    cambio = obter_cambio()
+
+    if not produtos:
+        await query.edit_message_text(
+            "Não consegui consultar o catálogo da 5SIM agora. Tente novamente mais tarde."
+        )
+        return
+
+    itens = [
+        item for item in encontrar_servicos(produtos)
+        if item[1] == nome_servico
+    ]
+
+    if not itens:
+        await query.edit_message_text(
+            f"Não encontrei ofertas para {SERVICOS[nome_servico]} no catálogo atual."
+        )
+        return
+
+    lucro = {
+        "whatsapp": LUCRO_WHATSAPP,
+        "telegram": LUCRO_TELEGRAM,
+        "sms": LUCRO_SMS,
+    }[nome_servico]
+
+    linhas = [
+        f"📋 Catálogo: {SERVICOS[nome_servico]}",
+        "Preços estimados em reais; confirme a disponibilidade antes de comprar.",
+        "",
+    ]
+
+    exibidos = 0
+    for pais, servico, detalhes in itens:
+        try:
+            preco_usd = float(detalhes["Price"])
+            quantidade = int(detalhes.get("Qty", 0))
+        except (KeyError, ValueError, TypeError):
+            continue
+
+        if cambio is None:
+            preco_texto = f"US$ {preco_usd:.2f} + margem R$ {lucro:.2f}"
+        else:
+            preco_brl = preco_usd * cambio + lucro
+            preco_texto = f"R$ {preco_brl:.2f}"
+
+        linhas.append(
+            f"🌍 {pais}\n"
+            f"💰 {preco_texto}\n"
+            f"📦 Disponíveis: {quantidade}\n"
+        )
+        exibidos += 1
+        if exibidos >= 15:
+            break
+
+    if not exibidos:
+        await query.edit_message_text("Não encontrei preços válidos para exibir.")
+        return
+
+    linhas.append("Use /start para voltar ao menu.")
+    texto = "\n".join(linhas)
+
+    # Limite de segurança do Telegram para mensagens.
+    await query.edit_message_text(texto[:4000])
+
+
+async def botoes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    escolha = query.data or ""
+
+    if escolha == "inicio":
+        await query.edit_message_text(
+            "👋 Bem-vindo ao DZ E-SIM!\nEscolha uma opção:",
+            reply_markup=montar_menu(),
+        )
+    elif escolha.startswith("paises:"):
+        try:
+            pagina = int(escolha.split(":")[1])
+        except (ValueError, IndexError):
+            pagina = 0
+        await mostrar_paises(query, pagina)
+    elif escolha.startswith("servicos:"):
+        partes = escolha.split(":")
+        if len(partes) == 3:
+            try:
+                pagina = int(partes[2])
+            except ValueError:
+                pagina = 0
+            await mostrar_catalogo(query, partes[1], pagina)
+    elif escolha.startswith("detalhe:"):
+        partes = escolha.split(":", 2)
+        if len(partes) == 3:
+            pais, nome = partes[1], partes[2]
+            produtos = buscar_produtos(pais, "any")
+            dados = produtos.get(nome, {})
+            if isinstance(dados, dict):
+                try:
+                    usd = float(dados.get("Price", 0))
+                    qtd = int(dados.get("Qty", 0))
+                    cambio = obter_cambio()
+                    margem = {
+                        "whatsapp": LUCRO_WHATSAPP,
+                        "telegram": LUCRO_TELEGRAM,
+                        "sms": LUCRO_SMS,
+                    }.get(nome.lower(), 2.00)
+                    preco = (
+                        f"R$ {usd * cambio + margem:.2f}"
+                        if cambio is not None
+                        else f"US$ {usd:.2f} + margem R$ {margem:.2f}"
+                    )
+                    texto = (
+                        f"📋 {nome}\n🌎 País: {pais}\n"
+                        f"💰 Preço estimado: {preco}\n"
+                        f"📦 Estoque informado: {qtd}\n\n"
+                        "ℹ️ Consulta informativa. Compra e entrega ainda não estão habilitadas."
+                    )
+                except (TypeError, ValueError):
+                    texto = "Não consegui ler o preço deste serviço."
+            else:
+                texto = "Serviço não encontrado no catálogo atual."
+            await query.edit_message_text(
+                texto,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        "⬅️ Voltar ao catálogo",
+                        callback_data=f"servicos:{pais}:0",
+                    )
+                ]]),
+            )
+
+
+async def erro_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logging.error("Erro ao processar atualização: %s", context.error)
+
+
+def main():
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token:
+        raise RuntimeError(
+            "A variável TELEGRAM_BOT_TOKEN não está configurada no terminal."
+        )
+
+    app = Application.builder().token(token).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(botoes))
+    app.add_error_handler(erro_handler)
+
+    print("DZ E-SIM iniciado. Aguardando mensagens...")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
