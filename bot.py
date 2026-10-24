@@ -92,8 +92,30 @@ def encontrar_servicos(produtos, pais="brazil"):
 
 def montar_menu():
     teclado = [
-        [InlineKeyboardButton("📱 Catálogo do Brasil (preços)", callback_data="servicos:brazil:0")],
-        [InlineKeyboardButton("🌎 Países disponíveis", callback_data="paises:0")],
+        [
+            InlineKeyboardButton(
+                "📱 Catálogo do Brasil (preços)",
+                callback_data="servicos:brazil:0",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🌎 Países disponíveis",
+                callback_data="paises:0",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "💰 Meu saldo",
+                callback_data="meu_saldo",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "💳 Recarregar saldo via PIX",
+                callback_data="recarregar_pix",
+            )
+        ],
     ]
     return InlineKeyboardMarkup(teclado)
 
