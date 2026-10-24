@@ -1,7 +1,6 @@
 import os
 import logging
 import requests
-
 from telegram.ext import (
     Application,
     CommandHandler,
