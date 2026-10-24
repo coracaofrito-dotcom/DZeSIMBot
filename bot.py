@@ -1,12 +1,22 @@
 import os
 import logging
 import requests
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+from saldo import (
+    consultar_saldo,
+    creditar_saldo,
+    registrar_cobranca,
+    consultar_cobranca,
+    marcar_cobranca_paga,
 )
 
 from paises import buscar_paises
