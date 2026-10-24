@@ -329,6 +329,62 @@ async def erro_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logging.error("Erro ao processar atualização: %s", context.error)
 
 
+def verificar_pagamento(pagamento_id, telegram_id):
+    import mercadopago
+
+    if not MP_ACCESS_TOKEN:
+        return {"erro": "Mercado Pago não configurado."}
+
+    cobranca = consultar_cobranca(pagamento_id)
+    if not cobranca or cobranca["telegram_id"] != telegram_id:
+        return {"erro": "Cobrança não encontrada para este usuário."}
+
+    if cobranca["status"] == "paga":
+        return {"aprovado": True, "ja_creditado": True}
+
+    try:
+        sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
+        resultado = sdk.payment().get(str(pagamento_id))
+
+        if resultado.get("status") != 200:
+            return {"erro": "Não foi possível consultar o pagamento."}
+
+        pagamento = resultado.get("response", {})
+
+        if pagamento.get("status") != "approved":
+            return {"aprovado": False}
+
+        referencia = str(pagamento.get("external_reference", ""))
+        valor_pago = round(float(pagamento.get("transaction_amount", 0)), 2)
+
+        if referencia != cobranca["referencia"]:
+            return {"erro": "A referência do pagamento não confere."}
+
+        if valor_pago != round(cobranca["valor"], 2):
+            return {"erro": "O valor pago não confere."}
+
+        creditou = creditar_saldo(
+            telegram_id,
+            valor_pago,
+            f"mercadopago:{pagamento_id}",
+        )
+
+        if not creditou:
+            return {"erro": "Não foi possível registrar o crédito."}
+
+        marcar_cobranca_paga(pagamento_id)
+
+        return {
+            "aprovado": True,
+            "valor": valor_pago,
+            "ja_creditado": False,
+        }
+
+    except Exception:
+        logging.exception("Erro ao verificar pagamento PIX.")
+        return {"erro": "Falha ao consultar o Mercado Pago."}
+
+
 def main():
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
