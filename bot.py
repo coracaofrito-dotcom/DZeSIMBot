@@ -265,16 +265,41 @@ async def botoes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     escolha = query.data or ""
 
     if escolha == "inicio":
+        context.user_data.pop("aguardando_valor_pix", None)
         await query.edit_message_text(
             "👋 Bem-vindo ao DZ E-SIM!\nEscolha uma opção:",
             reply_markup=montar_menu(),
         )
+
+    elif escolha == "meu_saldo":
+        saldo = consultar_saldo(query.from_user.id)
+        await query.edit_message_text(
+            f"💰 Meu saldo\n\nSaldo disponível: R$ {saldo:.2f}",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("💳 Recarregar via PIX", callback_data="recarregar_pix"),
+                InlineKeyboardButton("🏠 Menu", callback_data="inicio"),
+            ]]),
+        )
+
+    elif escolha == "recarregar_pix":
+        context.user_data["aguardando_valor_pix"] = True
+        await query.edit_message_text(
+            "💳 RECARGA VIA PIX\n\n"
+            "Digite o valor da recarga em reais.\n"
+            "Valor mínimo: R$ 5,00\n\n"
+            "Exemplo: 10,00",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Cancelar", callback_data="inicio")
+            ]]),
+        )
+
     elif escolha.startswith("paises:"):
         try:
             pagina = int(escolha.split(":")[1])
         except (ValueError, IndexError):
             pagina = 0
         await mostrar_paises(query, pagina)
+
     elif escolha.startswith("servicos:"):
         partes = escolha.split(":")
         if len(partes) == 3:
@@ -283,12 +308,14 @@ async def botoes(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except ValueError:
                 pagina = 0
             await mostrar_catalogo(query, partes[1], pagina)
+
     elif escolha.startswith("detalhe:"):
         partes = escolha.split(":", 2)
         if len(partes) == 3:
             pais, nome = partes[1], partes[2]
             produtos = buscar_produtos(pais, "any")
             dados = produtos.get(nome, {})
+
             if isinstance(dados, dict):
                 try:
                     usd = float(dados.get("Price", 0))
@@ -299,6 +326,7 @@ async def botoes(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         "telegram": LUCRO_TELEGRAM,
                         "sms": LUCRO_SMS,
                     }.get(nome.lower(), 2.00)
+
                     preco = (
                         f"R$ {usd * cambio + margem:.2f}"
                         if cambio is not None
@@ -314,6 +342,7 @@ async def botoes(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     texto = "Não consegui ler o preço deste serviço."
             else:
                 texto = "Serviço não encontrado no catálogo atual."
+
             await query.edit_message_text(
                 texto,
                 reply_markup=InlineKeyboardMarkup([[
