@@ -430,10 +430,6 @@ def main():
     app.run_polling()
 
 
-if __name__ == "__main__":
-    main()
-
-
 def criar_cobranca_pix(valor, descricao, referencia):
     """Cria uma cobrança PIX e retorna os dados necessários para o pagamento."""
     import mercadopago
@@ -485,3 +481,5 @@ def criar_cobranca_pix(valor, descricao, referencia):
     except Exception:
         logging.exception("Falha ao criar cobrança PIX.")
         return {"erro": "Erro ao comunicar com o Mercado Pago."}
+if __name__ == "__main__":
+    main()
