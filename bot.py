@@ -1,35 +1,40 @@
+
 import os
 import logging
+import uuid
+
 import requests
+import mercadopago
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
     ContextTypes,
-    MessageHandler,
-    filters,
 )
 
 from saldo import (
     consultar_saldo,
-    creditar_saldo,
     registrar_cobranca,
     consultar_cobranca,
-    marcar_cobranca_paga,
+    confirmar_pagamento,
 )
 
-from paises import buscar_paises
-
 logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(message)s",
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
+logger = logging.getLogger(__name__)
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN")
+MP_PAYER_EMAIL = os.getenv("MP_PAYER_EMAIL")
 
 VALOR_MINIMO_PIX = 5.00
-MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN")
-
 URL_PRODUTOS = "https://5sim.net/v1/guest/products/"
+URL_PAISES = "https://5sim.net/v1/guest/countries"
 URL_CAMBIO = "https://api.frankfurter.dev/v1/latest"
 
 LUCRO_WHATSAPP = 10.00
@@ -37,118 +42,135 @@ LUCRO_TELEGRAM = 3.00
 LUCRO_SMS = 2.00
 
 SERVICOS = {
-    "whatsapp": "WhatsApp",
-    "telegram": "Telegram",
-    "sms": "SMS",
+    "whatsapp": ("WhatsApp", LUCRO_WHATSAPP),
+    "telegram": ("Telegram", LUCRO_TELEGRAM),
+    "sms": ("SMS", LUCRO_SMS),
 }
+
+ITENS_POR_PAGINA = 8
+
+
+def dinheiro(valor):
+    return f"R$ {valor:.2f}".replace(".", ",")
 
 
 def obter_cambio():
     try:
-        r = requests.get(
+        resposta = requests.get(
             URL_CAMBIO,
             params={"from": "USD", "to": "BRL"},
             timeout=15,
         )
-        r.raise_for_status()
-        return float(r.json()["rates"]["BRL"])
-    except (requests.RequestException, KeyError, ValueError, TypeError):
+        resposta.raise_for_status()
+        return float(resposta.json()["rates"]["BRL"])
+    except (requests.RequestException, ValueError, KeyError, TypeError):
+        logger.exception("Não foi possível obter a cotação.")
         return None
 
 
 def buscar_produtos(pais="brazil", operadora="any"):
-    """Busca os produtos de um país e operadora na API pública da 5SIM."""
-    url = f"https://5sim.net/v1/guest/products/{pais}/{operadora}"
     try:
-        resposta = requests.get(url, timeout=20)
+        resposta = requests.get(
+            f"{URL_PRODUTOS}{pais}/{operadora}",
+            timeout=20,
+        )
         resposta.raise_for_status()
         dados = resposta.json()
         return dados if isinstance(dados, dict) else {}
-    except (requests.RequestException, ValueError) as erro:
-        logging.warning("Erro ao buscar produtos: %s", erro)
+    except (requests.RequestException, ValueError):
+        logger.exception("Erro ao consultar catálogo 5SIM.")
         return {}
 
 
-def encontrar_servicos(produtos, pais="brazil"):
-    """Retorna todos os serviços do catálogo, não apenas três nomes."""
+def encontrar_servicos(produtos):
     encontrados = []
-    if not isinstance(produtos, dict):
-        return encontrados
 
-    for servico, detalhes in produtos.items():
-        if not isinstance(detalhes, dict):
-            continue
-        try:
-            preco = float(detalhes.get("Price", 0) or 0)
-            quantidade = int(detalhes.get("Qty", 0) or 0)
-        except (TypeError, ValueError):
+    for nome, operadoras in produtos.items():
+        if not isinstance(operadoras, dict):
             continue
 
-        if preco >= 0 and quantidade > 0:
-            encontrados.append((pais, str(servico), detalhes))
+        for operadora, detalhes in operadoras.items():
+            if not isinstance(detalhes, dict):
+                continue
 
-    return sorted(encontrados, key=lambda item: item[1].lower())
+            try:
+                preco = float(detalhes.get("Price", 0) or 0)
+                quantidade = float(detalhes.get("Qty", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+
+            if preco > 0 and quantidade > 0:
+                encontrados.append((str(nome), str(operadora), preco, quantidade))
+
+    encontrados.sort(key=lambda item: (item[0].lower(), item[1].lower()))
+    return encontrados
 
 
 def montar_menu():
-    teclado = [
-        [
-            InlineKeyboardButton(
-                "📱 Catálogo do Brasil (preços)",
-                callback_data="servicos:brazil:0",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🌎 Países disponíveis",
-                callback_data="paises:0",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "💰 Meu saldo",
-                callback_data="meu_saldo",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "💳 Recarregar saldo via PIX",
-                callback_data="recarregar_pix",
-            )
-        ],
-    ]
-    return InlineKeyboardMarkup(teclado)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "📱 Catálogo do Brasil (preços)",
+            callback_data="servicos:brazil:0",
+        )],
+        [InlineKeyboardButton(
+            "🌎 Países disponíveis",
+            callback_data="paises:0",
+        )],
+        [InlineKeyboardButton(
+            "💰 Meu saldo",
+            callback_data="meu_saldo",
+        )],
+        [InlineKeyboardButton(
+            "💳 Recarregar saldo via PIX",
+            callback_data="recarregar_pix",
+        )],
+    ])
 
 
-def listar_paises():
-    """Obtém os países que a API pública da 5SIM disponibiliza."""
-    try:
-        r = requests.get("https://5sim.net/v1/guest/countries", timeout=20)
-        r.raise_for_status()
-        dados = r.json()
-        return sorted(dados.keys()) if isinstance(dados, dict) else []
-    except (requests.RequestException, ValueError):
-        logging.warning("Não foi possível consultar os países da 5SIM.")
-        return []
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(
+        "🇧🇷 *DZ E-SIM*\n\n"
+        "Consulte preços e disponibilidade informativa.\n"
+        "Compras e entrega de números ainda não estão habilitadas.",
+        reply_markup=montar_menu(),
+        parse_mode="Markdown",
+    )
 
 
 async def mostrar_paises(query, pagina=0):
-    paises = listar_paises()
-    if not paises:
+    try:
+        resposta = requests.get(URL_PAISES, timeout=20)
+        resposta.raise_for_status()
+        dados = resposta.json()
+    except (requests.RequestException, ValueError):
         await query.edit_message_text(
-            "Não consegui consultar os países agora. Tente novamente mais tarde."
+            "Não consegui consultar os países agora. Tente novamente.",
+            reply_markup=montar_menu(),
         )
         return
 
-    por_pagina = 8
-    inicio = pagina * por_pagina
-    lote = paises[inicio:inicio + por_pagina]
-    teclado = []
+    if not isinstance(dados, dict) or not dados:
+        await query.edit_message_text(
+            "Nenhum país foi retornado pelo fornecedor.",
+            reply_markup=montar_menu(),
+        )
+        return
 
-    for codigo in lote:
-        nome = codigo.replace("and", " and ").replace("-", " ").title()
-        teclado.append([
-            InlineKeyboardButton(nome, callback_data=f"servicos:{codigo}:0")
+    paises = sorted(dados.items(), key=lambda item: item[0].lower())
+    inicio = pagina * ITENS_POR_PAGINA
+    lista = paises[inicio:inicio + ITENS_POR_PAGINA]
+
+    botoes = []
+    for codigo, detalhes in lista:
+        nome = codigo
+        if isinstance(detalhes, dict):
+            nome = detalhes.get("name") or codigo
+
+        botoes.append([
+            InlineKeyboardButton(
+                str(nome)[:50],
+                callback_data=f"servicos:{codigo}:{0}",
+            )
         ])
 
     navegacao = []
@@ -156,330 +178,398 @@ async def mostrar_paises(query, pagina=0):
         navegacao.append(
             InlineKeyboardButton("⬅️ Anterior", callback_data=f"paises:{pagina - 1}")
         )
-    if inicio + por_pagina < len(paises):
+    if inicio + ITENS_POR_PAGINA < len(paises):
         navegacao.append(
-            InlineKeyboardButton("Próximos ➡️", callback_data=f"paises:{pagina + 1}")
+            InlineKeyboardButton("Próxima ➡️", callback_data=f"paises:{pagina + 1}")
         )
     if navegacao:
-        teclado.append(navegacao)
-    teclado.append([InlineKeyboardButton("🏠 Menu", callback_data="inicio")])
+        botoes.append(navegacao)
+
+    botoes.append([InlineKeyboardButton("🏠 Menu", callback_data="inicio")])
 
     await query.edit_message_text(
-        f"🌎 Escolha um país ({len(paises)} disponíveis)\n"
-        f"Página {pagina + 1} de {(len(paises) + por_pagina - 1) // por_pagina}:",
-        reply_markup=InlineKeyboardMarkup(teclado),
+        f"🌎 *Países disponíveis no fornecedor*\n"
+        f"Página {pagina + 1} de {max(1, (len(paises) - 1) // ITENS_POR_PAGINA + 1)}",
+        reply_markup=InlineKeyboardMarkup(botoes),
+        parse_mode="Markdown",
     )
 
 
 async def mostrar_catalogo(query, pais, pagina=0):
-    await query.edit_message_text("⏳ Consultando serviços, preços e estoque...")
     produtos = buscar_produtos(pais, "any")
-    cambio = obter_cambio()
+    encontrados = encontrar_servicos(produtos)
 
-    itens = encontrar_servicos(produtos, pais)
-    if not itens:
+    if not encontrados:
         await query.edit_message_text(
-            f"Não encontrei serviços com estoque para {pais}.",
+            "Não encontrei serviços com estoque disponível para esse país.\n"
+            "Tente novamente mais tarde.",
             reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("⬅️ Países", callback_data="paises:0")
+                InlineKeyboardButton("🏠 Menu", callback_data="inicio")
             ]]),
         )
         return
 
-    por_pagina = 8
-    total_paginas = (len(itens) + por_pagina - 1) // por_pagina
-    pagina = max(0, min(pagina, total_paginas - 1))
-    lote = itens[pagina * por_pagina:(pagina + 1) * por_pagina]
+    cambio = obter_cambio()
+    inicio = pagina * ITENS_POR_PAGINA
+    lista = encontrados[inicio:inicio + ITENS_POR_PAGINA]
 
+    botoes = []
     linhas = [
-        f"📋 Catálogo de serviços — {pais.title()}",
-        f"📦 {len(itens)} serviços com estoque",
-        "Preços estimados; nenhum pedido será comprado automaticamente.",
+        f"📱 *Catálogo informativo — {pais.upper()}*",
+        "Preços e estoque consultados no fornecedor.",
         "",
     ]
-    teclado = []
 
-    for _, nome, dados in lote:
-        try:
-            usd = float(dados.get("Price", 0))
-            qtd = int(dados.get("Qty", 0))
-        except (TypeError, ValueError):
-            continue
-
-        # Mantém as margens já configuradas para WhatsApp e Telegram;
-        # para os outros serviços aplica a margem padrão de R$ 2.
-        margens = {
-            "whatsapp": LUCRO_WHATSAPP,
-            "telegram": LUCRO_TELEGRAM,
-            "sms": LUCRO_SMS,
-        }
-        margem = margens.get(nome.lower(), 2.00)
+    for indice, (nome, operadora, preco_usd, quantidade) in enumerate(
+        lista, start=inicio + 1
+    ):
+        nome_servico = SERVICOS.get(nome.lower(), (nome, 0))[0]
+        margem = SERVICOS.get(nome.lower(), (nome, 0))[1]
 
         if cambio is None:
             preco_texto = "Preço temporariamente indisponível"
         else:
-            preco_texto = f"R$ {usd * cambio + margem:.2f}"
+            preco_texto = dinheiro(preco_usd * cambio + margem)
 
-        linhas.append(f"• {nome} — {preco_texto} | estoque: {qtd}")
-        teclado.append([
+        linhas.append(
+            f"{indice}. {nome_servico} — {operadora}\n"
+            f"   Preço estimado: {preco_texto}\n"
+            f"   Estoque informado: {quantidade:g}"
+        )
+
+        botoes.append([
             InlineKeyboardButton(
-                f"ℹ️ {nome[:45]}",
+                f"ℹ️ {indice}. {nome_servico} — {operadora}"[:60],
                 callback_data=f"detalhe:{pais}:{nome}",
             )
         ])
 
     navegacao = []
     if pagina > 0:
-        navegacao.append(InlineKeyboardButton(
-            "⬅️ Anterior", callback_data=f"servicos:{pais}:{pagina - 1}"
-        ))
-    if pagina + 1 < total_paginas:
-        navegacao.append(InlineKeyboardButton(
-            "Próxima ➡️", callback_data=f"servicos:{pais}:{pagina + 1}"
-        ))
+        navegacao.append(
+            InlineKeyboardButton(
+                "⬅️ Anterior",
+                callback_data=f"servicos:{pais}:{pagina - 1}",
+            )
+        )
+    if inicio + ITENS_POR_PAGINA < len(encontrados):
+        navegacao.append(
+            InlineKeyboardButton(
+                "Próxima ➡️",
+                callback_data=f"servicos:{pais}:{pagina + 1}",
+            )
+        )
     if navegacao:
-        teclado.append(navegacao)
-    teclado.append([InlineKeyboardButton("🌎 Trocar país", callback_data="paises:0")])
+        botoes.append(navegacao)
 
-    linhas.append("")
-    linhas.append(f"Página {pagina + 1} de {total_paginas}")
+    botoes.append([InlineKeyboardButton("🏠 Menu", callback_data="inicio")])
+
+    linhas.extend([
+        "",
+        "ℹ️ Consulta informativa. Compra e entrega ainda não estão habilitadas.",
+    ])
+
     await query.edit_message_text(
-        "\n".join(linhas)[:4000],
-        reply_markup=InlineKeyboardMarkup(teclado),
+        "\n".join(linhas),
+        reply_markup=InlineKeyboardMarkup(botoes),
+        parse_mode="Markdown",
     )
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    mensagem = (
-        "👋 Bem-vindo ao DZ E-SIM!\n\n"
-        "Escolha um serviço para consultar o catálogo de preços.\n"
-        "Este catálogo é informativo; nenhuma compra será realizada aqui."
-    )
-    if update.message:
-        await update.message.reply_text(mensagem, reply_markup=montar_menu())
+async def criar_cobranca_pix(valor, telegram_id):
+    if not MP_ACCESS_TOKEN:
+        return None, "O PIX ainda não está configurado no servidor."
+
+    if not MP_PAYER_EMAIL:
+        return None, (
+            "Falta configurar MP_PAYER_EMAIL com um e-mail válido "
+            "do pagador no ambiente do bot."
+        )
+
+    if valor < VALOR_MINIMO_PIX:
+        return None, f"A recarga mínima é {dinheiro(VALOR_MINIMO_PIX)}."
+
+    referencia = f"dz-esim-{telegram_id}-{uuid.uuid4().hex}"
+    sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
+
+    pagamento = {
+        "transaction_amount": round(float(valor), 2),
+        "description": "Recarga de saldo DZ E-SIM",
+        "payment_method_id": "pix",
+        "payer": {"email": MP_PAYER_EMAIL},
+        "external_reference": referencia,
+    }
+
+    try:
+        resultado = sdk.payment().create(pagamento)
+        resposta = resultado.get("response", {})
+        status_http = resultado.get("status")
+
+        if status_http not in (200, 201) or not resposta.get("id"):
+            logger.error("Mercado Pago recusou a criação da cobrança.")
+            return None, "Não foi possível criar o PIX. Tente novamente mais tarde."
+
+        pagamento_id = str(resposta["id"])
+        dados_pix = resposta.get("point_of_interaction", {}).get(
+            "transaction_data", {}
+        )
+        codigo_pix = dados_pix.get("qr_code")
+
+        if not codigo_pix:
+            return None, "O Mercado Pago não retornou o código PIX."
+
+        gravado = registrar_cobranca(
+            telegram_id,
+            pagamento_id,
+            valor,
+            referencia,
+        )
+        if not gravado:
+            logger.error("Não foi possível registrar a cobrança no banco.")
+            return None, "Não foi possível registrar a cobrança com segurança."
+
+        return {
+            "id": pagamento_id,
+            "codigo": codigo_pix,
+            "valor": round(float(valor), 2),
+        }, None
+
+    except Exception:
+        logger.exception("Erro ao criar cobrança PIX.")
+        return None, "Erro ao criar o PIX. Tente novamente mais tarde."
+
+
+async def verificar_pagamento(pagamento_id, telegram_id):
+    cobranca = consultar_cobranca(pagamento_id)
+
+    if not cobranca or cobranca["telegram_id"] != int(telegram_id):
+        return False, "Não encontrei essa cobrança na sua conta."
+
+    if cobranca["status"] == "paga":
+        return True, "Esse pagamento já foi confirmado."
+
+    if not MP_ACCESS_TOKEN:
+        return False, "O Mercado Pago não está configurado no servidor."
+
+    try:
+        sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
+        resultado = sdk.payment().get(str(pagamento_id))
+        resposta = resultado.get("response", {})
+
+        if resultado.get("status") != 200:
+            return False, "Não consegui consultar o pagamento agora."
+
+        if resposta.get("status") != "approved":
+            estado = resposta.get("status", "desconhecido")
+            return False, f"Pagamento ainda não aprovado. Status: {estado}."
+
+        referencia = resposta.get("external_reference", "")
+        valor = resposta.get("transaction_amount")
+
+        if valor is None:
+            return False, "Não foi possível validar o valor do pagamento."
+
+        confirmado = confirmar_pagamento(
+            pagamento_id,
+            float(valor),
+            referencia,
+        )
+
+        if not confirmado:
+            logger.warning(
+                "Pagamento não creditado: validação local falhou para ID %s",
+                pagamento_id,
+            )
+            return False, (
+                "O pagamento foi consultado, mas não passou na validação "
+                "da cobrança registrada. Entre em contato com o suporte."
+            )
+
+        return True, "Pagamento confirmado e saldo atualizado!"
+
+    except Exception:
+        logger.exception("Erro ao verificar pagamento PIX.")
+        return False, "Erro ao consultar o pagamento. Tente novamente."
 
 
 async def botoes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    escolha = query.data or ""
+    dados = query.data or ""
 
-    if escolha == "inicio":
-        context.user_data.pop("aguardando_valor_pix", None)
+    if dados == "inicio":
         await query.edit_message_text(
-            "👋 Bem-vindo ao DZ E-SIM!\nEscolha uma opção:",
+            "🇧🇷 *DZ E-SIM*\n\nEscolha uma opção:",
             reply_markup=montar_menu(),
+            parse_mode="Markdown",
         )
+        return
 
-    elif escolha == "meu_saldo":
+    if dados == "meu_saldo":
         saldo = consultar_saldo(query.from_user.id)
         await query.edit_message_text(
-            f"💰 Meu saldo\n\nSaldo disponível: R$ {saldo:.2f}",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("💳 Recarregar via PIX", callback_data="recarregar_pix"),
-                InlineKeyboardButton("🏠 Menu", callback_data="inicio"),
-            ]]),
+            f"💰 *Meu saldo*\n\nSaldo atual: *{dinheiro(saldo)}*",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    "💳 Recarregar via PIX",
+                    callback_data="recarregar_pix",
+                )],
+                [InlineKeyboardButton("🏠 Menu", callback_data="inicio")],
+            ]),
+            parse_mode="Markdown",
         )
+        return
 
-    elif escolha == "recarregar_pix":
+    if dados == "recarregar_pix":
         context.user_data["aguardando_valor_pix"] = True
         await query.edit_message_text(
-            "💳 RECARGA VIA PIX\n\n"
-            "Digite o valor da recarga em reais.\n"
-            "Valor mínimo: R$ 5,00\n\n"
-            "Exemplo: 10,00",
+            f"💳 *Recarga via PIX*\n\n"
+            f"Digite o valor desejado em reais, por exemplo: `10,00`\n"
+            f"Valor mínimo: *{dinheiro(VALOR_MINIMO_PIX)}*\n\n"
+            "Envie o valor como mensagem neste chat.",
             reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("❌ Cancelar", callback_data="inicio")
+                InlineKeyboardButton("🏠 Menu", callback_data="inicio")
             ]]),
+            parse_mode="Markdown",
         )
+        return
 
-    elif escolha.startswith("paises:"):
+    if dados.startswith("verificar:"):
+        pagamento_id = dados.split(":", 1)[1]
+        ok, mensagem = await verificar_pagamento(
+            pagamento_id,
+            query.from_user.id,
+        )
+        await query.edit_message_text(
+            ("✅ " if ok else "ℹ️ ") + mensagem,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("💰 Meu saldo", callback_data="meu_saldo")],
+                [InlineKeyboardButton("🏠 Menu", callback_data="inicio")],
+            ]),
+        )
+        return
+
+    if dados.startswith("paises:"):
         try:
-            pagina = int(escolha.split(":")[1])
-        except (ValueError, IndexError):
+            pagina = max(0, int(dados.split(":")[1]))
+        except (IndexError, ValueError):
             pagina = 0
         await mostrar_paises(query, pagina)
+        return
 
-    elif escolha.startswith("servicos:"):
-        partes = escolha.split(":")
+    if dados.startswith("servicos:"):
+        partes = dados.split(":")
         if len(partes) == 3:
+            pais = partes[1]
             try:
-                pagina = int(partes[2])
+                pagina = max(0, int(partes[2]))
             except ValueError:
                 pagina = 0
-            await mostrar_catalogo(query, partes[1], pagina)
+            await mostrar_catalogo(query, pais, pagina)
+        return
 
-    elif escolha.startswith("detalhe:"):
-        partes = escolha.split(":", 2)
+    if dados.startswith("detalhe:"):
+        partes = dados.split(":", 2)
         if len(partes) == 3:
-            pais, nome = partes[1], partes[2]
-            produtos = buscar_produtos(pais, "any")
-            dados = produtos.get(nome, {})
-
-            if isinstance(dados, dict):
-                try:
-                    usd = float(dados.get("Price", 0))
-                    qtd = int(dados.get("Qty", 0))
-                    cambio = obter_cambio()
-                    margem = {
-                        "whatsapp": LUCRO_WHATSAPP,
-                        "telegram": LUCRO_TELEGRAM,
-                        "sms": LUCRO_SMS,
-                    }.get(nome.lower(), 2.00)
-
-                    preco = (
-                        f"R$ {usd * cambio + margem:.2f}"
-                        if cambio is not None
-                        else "Preço temporariamente indisponível"
-                    )
-                    texto = (
-                        f"📋 {nome}\n🌎 País: {pais}\n"
-                        f"💰 Preço estimado: {preco}\n"
-                        f"📦 Estoque informado: {qtd}\n\n"
-                        "ℹ️ Consulta informativa. Compra e entrega ainda não estão habilitadas."
-                    )
-                except (TypeError, ValueError):
-                    texto = "Não consegui ler o preço deste serviço."
-            else:
-                texto = "Serviço não encontrado no catálogo atual."
-
             await query.edit_message_text(
-                texto,
+                f"ℹ️ Serviço: {partes[2]}\n"
+                f"País: {partes[1]}\n\n"
+                "Esta consulta é apenas informativa. Compra e entrega "
+                "de números ainda não estão habilitadas.",
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton(
                         "⬅️ Voltar ao catálogo",
-                        callback_data=f"servicos:{pais}:0",
+                        callback_data=f"servicos:{partes[1]}:0",
                     )
+                ], [
+                    InlineKeyboardButton("🏠 Menu", callback_data="inicio")
                 ]]),
             )
 
 
-async def erro_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logging.error("Erro ao processar atualização: %s", context.error)
+async def receber_valor_pix(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("aguardando_valor_pix"):
+        return
 
-
-def verificar_pagamento(pagamento_id, telegram_id):
-    import mercadopago
-
-    if not MP_ACCESS_TOKEN:
-        return {"erro": "Mercado Pago não configurado."}
-
-    cobranca = consultar_cobranca(pagamento_id)
-    if not cobranca or cobranca["telegram_id"] != telegram_id:
-        return {"erro": "Cobrança não encontrada para este usuário."}
-
-    if cobranca["status"] == "paga":
-        return {"aprovado": True, "ja_creditado": True}
+    texto = (update.effective_message.text or "").strip()
+    valor_texto = texto.replace("R$", "").replace(" ", "").replace(",", ".")
 
     try:
-        sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
-        resultado = sdk.payment().get(str(pagamento_id))
-
-        if resultado.get("status") != 200:
-            return {"erro": "Não foi possível consultar o pagamento."}
-
-        pagamento = resultado.get("response", {})
-
-        if pagamento.get("status") != "approved":
-            return {"aprovado": False}
-
-        referencia = str(pagamento.get("external_reference", ""))
-        valor_pago = round(float(pagamento.get("transaction_amount", 0)), 2)
-
-        if referencia != cobranca["referencia"]:
-            return {"erro": "A referência do pagamento não confere."}
-
-        if valor_pago != round(cobranca["valor"], 2):
-            return {"erro": "O valor pago não confere."}
-
-        creditou = creditar_saldo(
-            telegram_id,
-            valor_pago,
-            f"mercadopago:{pagamento_id}",
+        valor = round(float(valor_texto), 2)
+    except ValueError:
+        await update.effective_message.reply_text(
+            "Digite um valor válido, por exemplo: 10,00"
         )
+        return
 
-        if not creditou:
-            return {"erro": "Não foi possível registrar o crédito."}
+    if valor < VALOR_MINIMO_PIX:
+        await update.effective_message.reply_text(
+            f"A recarga mínima é {dinheiro(VALOR_MINIMO_PIX)}."
+        )
+        return
 
-        marcar_cobranca_paga(pagamento_id)
+    if valor > 10000:
+        await update.effective_message.reply_text(
+            "Para sua segurança, o limite por recarga é R$ 10.000,00."
+        )
+        return
 
-        return {
-            "aprovado": True,
-            "valor": valor_pago,
-            "ja_creditado": False,
-        }
+    context.user_data["aguardando_valor_pix"] = False
 
-    except Exception:
-        logging.exception("Erro ao verificar pagamento PIX.")
-        return {"erro": "Falha ao consultar o Mercado Pago."}
+    cobranca, erro = await criar_cobranca_pix(valor, update.effective_user.id)
+
+    if erro:
+        await update.effective_message.reply_text(erro)
+        return
+
+    await update.effective_message.reply_text(
+        f"💳 *PIX para recarga*\n\n"
+        f"Valor: *{dinheiro(cobranca['valor'])}*\n\n"
+        f"Copie e cole o código PIX abaixo no aplicativo do seu banco:\n\n"
+        f"`{cobranca['codigo']}`\n\n"
+        "Depois de pagar, toque em “Verificar pagamento”. "
+        "O saldo só será creditado após a confirmação do Mercado Pago.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                "🔎 Verificar pagamento",
+                callback_data=f"verificar:{cobranca['id']}",
+            )],
+            [InlineKeyboardButton("💰 Meu saldo", callback_data="meu_saldo")],
+            [InlineKeyboardButton("🏠 Menu", callback_data="inicio")],
+        ]),
+        parse_mode="Markdown",
+    )
+
+
+async def erro_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error(
+        "Erro durante o processamento da atualização.",
+        exc_info=context.error,
+    )
 
 
 def main():
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    if not token:
+    if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError(
-            "A variável TELEGRAM_BOT_TOKEN não está configurada no terminal."
+            "Configure TELEGRAM_BOT_TOKEN nas variáveis de ambiente."
         )
 
-    app = Application.builder().token(token).build()
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(botoes))
+    app.add_handler(
+        # Só captura mensagens de texto; não interfere nos comandos.
+        __import__("telegram.ext", fromlist=["MessageHandler"]).MessageHandler(
+            __import__("telegram.ext", fromlist=["filters"]).filters.TEXT
+            & ~__import__("telegram.ext", fromlist=["filters"]).filters.COMMAND,
+            receber_valor_pix,
+        )
+    )
     app.add_error_handler(erro_handler)
 
-    print("DZ E-SIM iniciado. Aguardando mensagens...")
+    logger.info("DZ E-SIM iniciado.")
     app.run_polling()
 
 
-def criar_cobranca_pix(valor, descricao, referencia):
-    """Cria uma cobrança PIX e retorna os dados necessários para o pagamento."""
-    import mercadopago
-
-    try:
-        valor = round(float(valor), 2)
-    except (TypeError, ValueError):
-        return {"erro": "Valor inválido."}
-
-    if valor < VALOR_MINIMO_PIX:
-        return {"erro": "O valor mínimo para pagamento PIX é R$ 5,00."}
-
-    if not MP_ACCESS_TOKEN:
-        return {"erro": "Mercado Pago não configurado."}
-
-    try:
-        sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
-        pagamento = sdk.payment().create({
-            "transaction_amount": valor,
-            "description": str(descricao)[:200],
-            "payment_method_id": "pix",
-            "external_reference": str(referencia)[:100],
-            "payer": {
-                "email": os.getenv("MP_PAYER_EMAIL", "test_user_123456@testuser.com"),
-            },
-        })
-
-        resposta = pagamento.get("response", {})
-        if pagamento.get("status") not in (200, 201):
-            return {"erro": "Não foi possível criar a cobrança PIX."}
-
-        dados_pix = resposta.get("point_of_interaction", {}).get(
-            "transaction_data", {}
-        )
-        codigo = dados_pix.get("qr_code")
-        imagem_base64 = dados_pix.get("qr_code_base64")
-
-        if not resposta.get("id") or not codigo:
-            return {"erro": "O Mercado Pago não retornou os dados PIX esperados."}
-
-        return {
-            "id": resposta["id"],
-            "status": resposta.get("status", "pending"),
-            "valor": valor,
-            "codigo_pix": codigo,
-            "qr_code_base64": imagem_base64,
-            "referencia": str(referencia),
-        }
-    except Exception:
-        logging.exception("Falha ao criar cobrança PIX.")
-        return {"erro": "Erro ao comunicar com o Mercado Pago."}
 if __name__ == "__main__":
     main()
