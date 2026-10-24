@@ -46,15 +46,13 @@ def consultar_saldo(telegram_id):
     with conectar() as con:
         con.execute(
             "INSERT OR IGNORE INTO clientes (telegram_id) VALUES (?)",
-            (telegram_id,)
+            (int(telegram_id),)
         )
-
-        resultado = con.execute(
+        linha = con.execute(
             "SELECT saldo FROM clientes WHERE telegram_id = ?",
-            (telegram_id,)
+            (int(telegram_id),)
         ).fetchone()
-
-        return round(float(resultado[0]), 2)
+        return round(float(linha[0]), 2)
 
 
 def creditar_saldo(telegram_id, valor, referencia):
@@ -68,8 +66,8 @@ def creditar_saldo(telegram_id, valor, referencia):
         cursor = con.execute("""
             INSERT OR IGNORE INTO movimentacoes
                 (telegram_id, tipo, valor, referencia)
-            VALUES (?, 'recarga_pix', ?, ?)
-        """, (telegram_id, valor, referencia))
+            VALUES (?, 'ajuste', ?, ?)
+        """, (int(telegram_id), valor, referencia))
 
         if cursor.rowcount != 1:
             return False
@@ -77,13 +75,12 @@ def creditar_saldo(telegram_id, valor, referencia):
         con.execute("""
             INSERT OR IGNORE INTO clientes (telegram_id, saldo)
             VALUES (?, 0)
-        """, (telegram_id,))
+        """, (int(telegram_id),))
 
         con.execute("""
-            UPDATE clientes
-            SET saldo = saldo + ?
+            UPDATE clientes SET saldo = saldo + ?
             WHERE telegram_id = ?
-        """, (valor, telegram_id))
+        """, (valor, int(telegram_id)))
 
     return True
 
@@ -101,8 +98,7 @@ def registrar_cobranca(telegram_id, pagamento_id, valor, referencia):
             INSERT OR IGNORE INTO cobrancas_pix
                 (pagamento_id, telegram_id, valor, referencia)
             VALUES (?, ?, ?, ?)
-        """, (pagamento_id, telegram_id, valor, referencia))
-
+        """, (pagamento_id, int(telegram_id), valor, referencia))
         return cursor.rowcount == 1
 
 
@@ -110,31 +106,88 @@ def consultar_cobranca(pagamento_id):
     with conectar() as con:
         linha = con.execute("""
             SELECT telegram_id, valor, referencia, status
-            FROM cobrancas_pix
-            WHERE pagamento_id = ?
+            FROM cobrancas_pix WHERE pagamento_id = ?
         """, (str(pagamento_id),)).fetchone()
 
     if not linha:
         return None
 
     return {
-        "telegram_id": linha[0],
-        "valor": float(linha[1]),
+        "telegram_id": int(linha[0]),
+        "valor": round(float(linha[1]), 2),
         "referencia": linha[2],
         "status": linha[3],
     }
 
 
-def marcar_cobranca_paga(pagamento_id):
-    with conectar() as con:
-        cursor = con.execute("""
-            UPDATE cobrancas_pix
-            SET status = 'paga'
-            WHERE pagamento_id = ?
-              AND status = 'pendente'
-        """, (str(pagamento_id),))
+def confirmar_pagamento(pagamento_id, valor_confirmado, referencia_confirmada):
+    """
+    Confirma e credita uma cobrança uma única vez.
+    O chamador deve validar o status aprovado na API do Mercado Pago.
+    """
+    pagamento_id = str(pagamento_id).strip()
+    referencia_confirmada = str(referencia_confirmada or "").strip()
+    valor_confirmado = round(float(valor_confirmado), 2)
 
-        return cursor.rowcount == 1
+    if not pagamento_id or not referencia_confirmada:
+        return False
+
+    with conectar() as con:
+        cobranca = con.execute("""
+            SELECT telegram_id, valor, referencia, status
+            FROM cobrancas_pix WHERE pagamento_id = ?
+        """, (pagamento_id,)).fetchone()
+
+        if not cobranca:
+            return False
+
+        telegram_id, valor_esperado, referencia_esperada, status = cobranca
+        valor_esperado = round(float(valor_esperado), 2)
+
+        if status == "paga":
+            return True
+
+        if status != "pendente":
+            return False
+
+        if referencia_confirmada != referencia_esperada:
+            return False
+
+        if valor_confirmado != valor_esperado:
+            return False
+
+        referencia_movimento = f"pix:{pagamento_id}"
+
+        cursor = con.execute("""
+            INSERT OR IGNORE INTO movimentacoes
+                (telegram_id, tipo, valor, referencia)
+            VALUES (?, 'recarga_pix', ?, ?)
+        """, (telegram_id, valor_esperado, referencia_movimento))
+
+        if cursor.rowcount != 1:
+            return False
+
+        con.execute("""
+            INSERT OR IGNORE INTO clientes (telegram_id, saldo)
+            VALUES (?, 0)
+        """, (telegram_id,))
+
+        con.execute("""
+            UPDATE clientes SET saldo = saldo + ?
+            WHERE telegram_id = ?
+        """, (valor_esperado, telegram_id))
+
+        con.execute("""
+            UPDATE cobrancas_pix SET status = 'paga'
+            WHERE pagamento_id = ? AND status = 'pendente'
+        """, (pagamento_id,))
+
+    return True
+
+
+def marcar_cobranca_paga(pagamento_id):
+    # Não marca como paga sem creditar o saldo de forma atômica.
+    return False
 
 
 inicializar_banco()
